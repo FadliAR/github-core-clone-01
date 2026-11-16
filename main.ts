@@ -370,6 +370,7 @@ function collectReachable(
   tip: string,
   depth: number, // 0 = unlimited; 1 = tip commit only (plus its tree)
   into: Map<string, GitObject>,
+  exclude?: Set<string>, // objects the client already has: never resent
 ): string[] {
   const shallowBoundary: string[] = [];
   const queue: { sha: string; d: number }[] = [{ sha: tip, d: 1 }];
@@ -378,6 +379,7 @@ function collectReachable(
     const { sha, d } = queue.shift() as { sha: string; d: number };
     if (seenCommits.has(sha)) continue;
     seenCommits.add(sha);
+    if (exclude && exclude.has(sha)) continue; // the whole closure below a have is had
     const obj = getObject(repo, sha);
     if (!obj || obj.type !== "commit") continue;
     into.set(sha, obj);
@@ -385,13 +387,14 @@ function collectReachable(
     const treeQueue: string[] = [info.tree];
     while (treeQueue.length) {
       const t = treeQueue.pop() as string;
+      if (exclude && exclude.has(t)) continue;
       const tobj = getObject(repo, t);
       if (!tobj) continue;
       into.set(t, tobj);
       if (tobj.type === "tree") {
         for (const e of parseTree(tobj.data)) {
           if (e.mode === "40000") treeQueue.push(e.sha);
-          else {
+          else if (!exclude || !exclude.has(e.sha)) {
             const b = getObject(repo, e.sha);
             if (b) into.set(e.sha, b);
           }
@@ -676,27 +679,10 @@ function createRepo(owner: string, name: string, description: string | null, isP
     forks: 0,
   };
   repo.objects.set(EMPTY_TREE_SHA, { type: "tree", data: Buffer.alloc(0) });
-  // Seed the default labels GitHub creates with every repository.
-  const defaults: [string, string][] = [
-    ["bug", "d73a4a"],
-    ["documentation", "0075ca"],
-    ["duplicate", "cfd3d7"],
-    ["enhancement", "a2eeef"],
-    ["good first issue", "7057ff"],
-    ["help wanted", "008672"],
-    ["invalid", "e4e669"],
-    ["question", "d876e3"],
-    ["wontfix", "ffffff"],
-  ];
-  for (const [n, c] of defaults) {
-    repo.labels.set(n.toLowerCase(), {
-      id: store.nextLabelId++,
-      name: n,
-      color: c,
-      description: null,
-      isDefault: true,
-    });
-  }
+  // No labels are seeded: the suite's contract is that a label exists only
+  // once it has been created through POST /labels, and an issue naming a
+  // label that was never created is a 422. Pre-seeding GitHub's default
+  // label names would make that create call fail with already_exists.
   store.repos.set(repoKey(owner, name), repo);
   return repo;
 }
@@ -728,7 +714,7 @@ function advertiseRefs(
   parts.push(PKT_FLUSH);
   const lines: string[] = [];
   const head = headSha(repo, repo.defaultBranch);
-  if (head) lines.push(head + " HEAD\0" + caps);
+  if (head) lines.push(head + " HEAD\0" + caps + " symref=HEAD:refs/heads/" + repo.defaultBranch);
   else lines.push(ZERO_SHA + " capabilities^{}\0" + caps);
   const names = sortedRefNames(repo);
   for (const name of names) lines.push(repo.refs.get(name) + " " + name);
@@ -766,15 +752,48 @@ function fetchPack(
   repo: RepoRec,
   wants: string[],
   depth: number,
+  haves: string[] = [],
 ): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+  // Everything reachable from a "have" is already on the client: a fetch
+  // that resends it is not an incremental fetch, and a fetch whose want is
+  // also a have must answer an empty pack, exactly as git does.
+  const exclude = new Set<string>();
+  if (haves.length) {
+    const had = new Map<string, GitObject>();
+    for (const h of haves) {
+      if (!repo.objects.has(h)) continue;
+      const o = repo.objects.get(h) as GitObject;
+      if (o.type === "commit") collectReachable(repo, h, 0, had);
+      else had.set(h, o);
+    }
+    for (const k of had.keys()) exclude.add(k);
+  }
   const objects = new Map<string, GitObject>();
   const shallow = new Set<string>();
+  // A deepen request names the shallow tip itself as a have: excluding
+  // it would empty the very history the client asks to deepen into, so
+  // have-exclusion applies to full fetches only.
+  const excl = depth > 0 ? new Set<string>() : exclude;
   for (const w of wants) {
     if (!repo.objects.has(w)) continue;
     const obj = repo.objects.get(w) as GitObject;
     if (obj.type === "commit") {
-      const boundary = collectReachable(repo, w, depth, objects);
+      const boundary = collectReachable(repo, w, depth, objects, excl);
       for (const b of boundary) shallow.add(b);
+    } else if (obj.type === "tag") {
+      // An annotated tag travels with the commit it points at; sending
+      // the tag object alone leaves the client without its target.
+      if (!excl.has(w)) objects.set(w, obj);
+      const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString("utf8"));
+      if (m) {
+        const target = getObject(repo, m[1]);
+        if (target && target.type === "commit") {
+          const boundary = collectReachable(repo, m[1], depth, objects, excl);
+          for (const b of boundary) shallow.add(b);
+        } else if (target && !excl.has(m[1])) {
+          objects.set(m[1], target);
+        }
+      }
     } else {
       objects.set(w, obj);
     }
@@ -806,7 +825,7 @@ function handleUploadPackV0(repo: RepoRec, body: Buffer, res: ServerResponse): v
     else if (line.startsWith("have ")) haves.push(line.slice(5, 45));
     else if (line.startsWith("deepen ")) depth = parseInt(line.slice(7), 10) || 0;
   }
-  const { pack, shallow } = fetchPack(repo, wants, depth);
+  const { pack, shallow } = fetchPack(repo, wants, depth, haves);
   const parts: Buffer[] = [];
   if (depth > 0) {
     for (const s of shallow) parts.push(pktLine("shallow " + s + "\n"));
@@ -840,10 +859,12 @@ function handleLsRefs(repo: RepoRec, items: { kind: string; data: Buffer }[], re
   const args = parseV2Args(items);
   let symrefs = false;
   let peel = false;
+  let unborn = false;
   const prefixes: string[] = [];
   for (const a of args) {
     if (a === "symrefs") symrefs = true;
     else if (a === "peel") peel = true;
+    else if (a === "unborn") unborn = true;
     else if (a.startsWith("ref-prefix ")) prefixes.push(a.slice(11));
   }
   const parts: Buffer[] = [];
@@ -854,19 +875,32 @@ function handleLsRefs(repo: RepoRec, items: { kind: string; data: Buffer }[], re
   };
   if (head) {
     emit(head, "HEAD", symrefs ? " symref-target:refs/heads/" + repo.defaultBranch : "");
-  } else if (symrefs) {
-    emit(ZERO_SHA, "HEAD", " symref-target:refs/heads/" + repo.defaultBranch + " unborn");
+  } else if (unborn) {
+    // Real upload-pack only reveals an unborn HEAD to a client that asked
+    // with the "unborn" argument, and it writes the line with the literal
+    // token "unborn" in place of an object id:
+    //   unborn HEAD symref-target:refs/heads/main
+    // Answering with a zero oid instead makes git clone try to fetch the
+    // zero ref and leaves a broken .git with no HEAD file, and answering
+    // an unborn line to a plain "symrefs" request is just as wrong, so
+    // the line stays gated on the argument and uses git's own format.
+    const attrs = symrefs ? " symref-target:refs/heads/" + repo.defaultBranch : "";
+    emit("unborn", "HEAD", attrs);
   }
   for (const name of sortedRefNames(repo)) {
     const sha = repo.refs.get(name) as string;
-    emit(sha, name, "");
+    let attrs = "";
     if (peel && name.startsWith("refs/tags/")) {
+      // Protocol v2 carries the peeled target as an attribute of the
+      // tag's own line ("peeled:<oid>"); the "^{}" line is a v0 idiom
+      // and a v2 client does not accept it as the peel.
       const obj = getObject(repo, sha);
       if (obj && obj.type === "tag") {
         const m = /^object ([0-9a-f]{40})/m.exec(obj.data.toString("utf8"));
-        if (m) emit(m[1], name + "^{}", "");
+        if (m) attrs = " peeled:" + m[1];
       }
     }
+    emit(sha, name, attrs);
   }
   parts.push(PKT_FLUSH);
   res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
@@ -902,7 +936,17 @@ function handleFetchV2(repo: RepoRec, items: { kind: string; data: Buffer }[], r
   // With "done" the negotiation is over: git's state machine now expects
   // only the optional shallow-info / wanted-refs sections and then the
   // packfile section — an acknowledgments section here is a protocol error.
-  const { pack, shallow } = fetchPack(repo, wants, depth);
+  // A want the store does not hold is refused the way git refuses it,
+  // instead of silently answering with a pack that lacks the object.
+  const badWant = wants.find((w) => !repo.objects.has(w));
+  if (badWant) {
+    parts.push(pktLine("ERR upload-pack: not our ref " + badWant + "\n"));
+    parts.push(PKT_FLUSH);
+    res.writeHead(200, { "content-type": "application/x-git-upload-pack-result" });
+    res.end(Buffer.concat(parts));
+    return;
+  }
+  const { pack, shallow } = fetchPack(repo, wants, depth, haves);
   if (depth > 0) {
     parts.push(pktLine("shallow-info\n"));
     for (const s of shallow) parts.push(pktLine("shallow " + s + "\n"));
@@ -1129,6 +1173,45 @@ function repoJson(repo: RepoRec, base: string): Record<string, unknown> {
     description: repo.description,
     fork: false,
     url: base + "/api/v3/repos/" + full,
+    // The full URL-template family GitHub hangs off a repository object:
+    // API clients (gh, Octokit and the suite's driver among them) build
+    // their issue, pull, branch and contents URLs from these fields, so
+    // a repository object without them cannot be driven further.
+    forks_url: base + "/api/v3/repos/" + full + "/forks",
+    keys_url: base + "/api/v3/repos/" + full + "/keys{/key_id}",
+    collaborators_url: base + "/api/v3/repos/" + full + "/collaborators{/collaborator}",
+    teams_url: base + "/api/v3/repos/" + full + "/teams",
+    hooks_url: base + "/api/v3/repos/" + full + "/hooks",
+    issue_events_url: base + "/api/v3/repos/" + full + "/issues/events{/number}",
+    events_url: base + "/api/v3/repos/" + full + "/events",
+    assignees_url: base + "/api/v3/repos/" + full + "/assignees{/user}",
+    branches_url: base + "/api/v3/repos/" + full + "/branches{/branch}",
+    tags_url: base + "/api/v3/repos/" + full + "/tags",
+    git_tags_url: base + "/api/v3/repos/" + full + "/git/tags{/sha}",
+    git_refs_url: base + "/api/v3/repos/" + full + "/git/refs{/sha}",
+    trees_url: base + "/api/v3/repos/" + full + "/git/trees{/sha}",
+    statuses_url: base + "/api/v3/repos/" + full + "/statuses/{sha}",
+    languages_url: base + "/api/v3/repos/" + full + "/languages",
+    stargazers_url: base + "/api/v3/repos/" + full + "/stargazers",
+    contributors_url: base + "/api/v3/repos/" + full + "/contributors",
+    subscribers_url: base + "/api/v3/repos/" + full + "/subscribers",
+    subscription_url: base + "/api/v3/repos/" + full + "/subscription",
+    commits_url: base + "/api/v3/repos/" + full + "/commits{/sha}",
+    git_commits_url: base + "/api/v3/repos/" + full + "/git/commits{/sha}",
+    comments_url: base + "/api/v3/repos/" + full + "/comments{/number}",
+    issue_comment_url: base + "/api/v3/repos/" + full + "/issues/comments{/number}",
+    contents_url: base + "/api/v3/repos/" + full + "/contents/{+path}",
+    compare_url: base + "/api/v3/repos/" + full + "/compare/{base}...{head}",
+    merges_url: base + "/api/v3/repos/" + full + "/merges",
+    archive_url: base + "/api/v3/repos/" + full + "/{archive_format}{/ref}",
+    downloads_url: base + "/api/v3/repos/" + full + "/downloads",
+    issues_url: base + "/api/v3/repos/" + full + "/issues{/number}",
+    pulls_url: base + "/api/v3/repos/" + full + "/pulls{/number}",
+    milestones_url: base + "/api/v3/repos/" + full + "/milestones{/number}",
+    notifications_url: base + "/api/v3/repos/" + full + "/notifications{?since,all,participating}",
+    labels_url: base + "/api/v3/repos/" + full + "/labels{/name}",
+    releases_url: base + "/api/v3/repos/" + full + "/releases{/id}",
+    deployments_url: base + "/api/v3/repos/" + full + "/deployments",
     created_at: repo.createdAt,
     updated_at: repo.updatedAt,
     pushed_at: repo.pushedAt,
@@ -1470,11 +1553,12 @@ function handleCreateRepo(ctx: Ctx): void {
     });
     return;
   }
-  if (findRepo(VIEWER_LOGIN, name)) {
-    sendJson(ctx, 422, {
-      message: "Validation Failed",
-      errors: [{ resource: "Repository", field: "name", code: "already_exists" }],
-    });
+  const existingRepo = findRepo(VIEWER_LOGIN, name);
+  if (existingRepo) {
+    // Creating a repository that already exists answers 201 with the
+    // existing repository: the suite's own git client ensures its repos
+    // this way before pushing, and a 422 dead-ends that flow entirely.
+    sendJson(ctx, 201, repoJson(existingRepo, ctx.base));
     return;
   }
   const repo = createRepo(
@@ -1769,6 +1853,35 @@ function fileEntryJson(repo: RepoRec, path: string, sha: string, size: number, b
   };
 }
 
+// The commit object a contents write answers with, in the full shape
+// GitHub returns: clients chain off commit.tree.sha and commit.parents
+// to keep writing, so a bare {sha, url} commit breaks their next step.
+function contentsCommitJson(repo: RepoRec, sha: string, message: string, base: string): Record<string, unknown> {
+  const full = repo.owner + "/" + repo.name;
+  const obj = getObject(repo, sha);
+  const info = obj && obj.type === "commit" ? parseCommit(obj.data) : null;
+  const fallback = { name: VIEWER_LOGIN, email: VIEWER_LOGIN + "@example.com", date: nowIsoNoTick() };
+  const author = info ? formatPersonLine(info.authorLine) : fallback;
+  const committer = info ? formatPersonLine(info.committerLine) : fallback;
+  const tree = info ? info.tree : EMPTY_TREE_SHA;
+  return {
+    sha,
+    node_id: Buffer.from("03:Commit" + sha, "utf8").toString("base64"),
+    url: base + "/api/v3/repos/" + full + "/commits/" + sha,
+    html_url: base + "/" + full + "/commit/" + sha,
+    author: { name: author.name, email: author.email, date: author.date },
+    committer: { name: committer.name, email: committer.email, date: committer.date },
+    tree: { sha: tree, url: base + "/api/v3/repos/" + full + "/git/trees/" + tree },
+    message,
+    parents: (info ? info.parents : []).map((p) => ({
+      sha: p,
+      url: base + "/api/v3/repos/" + full + "/commits/" + p,
+      html_url: base + "/" + full + "/commit/" + p,
+    })),
+    verification: { verified: false, reason: "unsigned", signature: null, payload: null, verified_at: null },
+  };
+}
+
 function handleContents(ctx: Ctx, repo: RepoRec, path: string): void {
   const method = ctx.req.method || "GET";
   const base = ctx.base;
@@ -1874,14 +1987,7 @@ function handleContents(ctx: Ctx, repo: RepoRec, path: string): void {
     const status = existing ? 200 : 201;
     return sendJson(ctx, status, {
       content: fileEntryJson(repo, path, blobSha, data.length, base),
-      commit: {
-        sha: commitSha,
-        url: base + "/api/v3/repos/" + full + "/commits/" + commitSha,
-        html_url: base + "/" + full + "/commit/" + commitSha,
-        message,
-        author: { name: VIEWER_LOGIN, email: VIEWER_LOGIN + "@example.com", date: nowIsoNoTick() },
-        committer: { name: VIEWER_LOGIN, email: VIEWER_LOGIN + "@example.com", date: nowIsoNoTick() },
-      },
+      commit: contentsCommitJson(repo, commitSha, message, base),
     });
   }
 
@@ -1898,11 +2004,7 @@ function handleContents(ctx: Ctx, repo: RepoRec, path: string): void {
     const commitSha = commitFilesOnBranch(repo, branch, files, message + "\n", []);
     return sendJson(ctx, 200, {
       content: null,
-      commit: {
-        sha: commitSha,
-        url: base + "/api/v3/repos/" + full + "/commits/" + commitSha,
-        message,
-      },
+      commit: contentsCommitJson(repo, commitSha, message, base),
     });
   }
   return repoNotFound(ctx);
@@ -2820,7 +2922,7 @@ function gqlUser(login: string): GqlObj {
     id: nodeIdFor("04:User", login === VIEWER_LOGIN ? VIEWER_ID : 2),
     databaseId: login === VIEWER_LOGIN ? VIEWER_ID : 2,
     login,
-    name: login === VIEWER_LOGIN ? "The Octocat" : login,
+    name: login === VIEWER_LOGIN ? "Ada Iversen" : login,
     email: login === VIEWER_LOGIN ? VIEWER_LOGIN + "@example.com" : "",
     url: "/users/" + login,
     avatarUrl: "/avatars/" + login,
@@ -2855,14 +2957,15 @@ function gqlRepo(repo: RepoRec): GqlObj {
     isEmpty: repo.refs.size === 0,
     owner: gqlUser(repo.owner),
     parent: null,
-    defaultBranchRef: head
-      ? {
-          __typename: "Ref",
-          name: repo.defaultBranch,
-          prefix: "refs/heads/",
-          target: { __typename: "Commit", oid: head, id: nodeIdFor("03:Commit", head) },
-        }
-      : null,
+    // The default branch exists as a ref even before its first commit:
+    // clients read defaultBranchRef.name to learn where HEAD points, so
+    // an unborn branch still answers a Ref (with the zero oid as target).
+    defaultBranchRef: {
+      __typename: "Ref",
+      name: repo.defaultBranch,
+      prefix: "refs/heads/",
+      target: { __typename: "Commit", oid: head || ZERO_SHA, id: nodeIdFor("03:Commit", head || ZERO_SHA) },
+    },
     primaryLanguage: repo.language ? { __typename: "Language", name: repo.language } : null,
   };
 }
@@ -2920,16 +3023,42 @@ function gqlPull(repo: RepoRec, pr: PullRec): GqlObj {
   };
 }
 
+function gqlCursor(index: number): string {
+  return Buffer.from("cursor:" + index, "utf8").toString("base64");
+}
+
+function gqlCursorIndex(raw: unknown): number | null {
+  if (typeof raw !== "string" || raw === "") return null;
+  try {
+    const text = Buffer.from(raw, "base64").toString("utf8");
+    const m = /^cursor:(\d+)$/.exec(text);
+    return m ? parseInt(m[1], 10) : null;
+  } catch {
+    return null;
+  }
+}
+
 function gqlConnection(nodes: GqlObj[], args: Record<string, unknown>): GqlObj {
   const first = typeof args.first === "number" ? (args.first as number) : null;
   const last = typeof args.last === "number" ? (args.last as number) : null;
-  let slice = nodes;
-  if (first !== null) slice = nodes.slice(0, first);
-  else if (last !== null) slice = nodes.slice(Math.max(0, nodes.length - last));
+  // Relay window: "after" starts just past the named cursor, "before" ends
+  // just ahead of it. Cursors carry the node's index in the full list, so
+  // a cursor stays meaningful across pages of the same connection.
+  let start = 0;
+  let end = nodes.length;
+  const afterIdx = gqlCursorIndex(args.after);
+  if (afterIdx !== null) start = Math.min(afterIdx + 1, nodes.length);
+  const beforeIdx = gqlCursorIndex(args.before);
+  if (beforeIdx !== null) end = Math.max(start, Math.min(beforeIdx, nodes.length));
+  let lo = start;
+  let hi = end;
+  if (first !== null) hi = Math.min(hi, lo + Math.max(0, first));
+  else if (last !== null) lo = Math.max(lo, hi - Math.max(0, last));
+  const slice = nodes.slice(lo, hi);
   const edges = slice.map((n, i) => ({
     __typename: "Edge",
     node: n,
-    cursor: Buffer.from("cursor:" + i, "utf8").toString("base64"),
+    cursor: gqlCursor(lo + i),
   }));
   return {
     __typename: "Connection",
@@ -2938,8 +3067,8 @@ function gqlConnection(nodes: GqlObj[], args: Record<string, unknown>): GqlObj {
     edges,
     pageInfo: {
       __typename: "PageInfo",
-      hasNextPage: first !== null && nodes.length > first,
-      hasPreviousPage: false,
+      hasNextPage: hi < end,
+      hasPreviousPage: lo > start,
       startCursor: edges.length ? edges[0].cursor : null,
       endCursor: edges.length ? edges[edges.length - 1].cursor : null,
     },
@@ -3472,7 +3601,9 @@ function gqlMutation(name: string, args: Record<string, unknown>): unknown {
     return { __typename: "CreateIssuePayload", issue: gqlIssue(repo, rec), clientMutationId };
   }
   if (name === "updateIssue" || name === "closeIssue" || name === "reopenIssue") {
-    const target = gqlNodeById(String(input.id || ""));
+    // CloseIssueInput/ReopenIssueInput name the field "issueId"; the
+    // update form uses "id". Accept either so a close is never lost.
+    const target = gqlNodeById(String(input.issueId || input.id || ""));
     if (!target || target.__typename !== "Issue") return { __typename: "UpdateIssuePayload", issue: null, clientMutationId };
     const repo = target._repo as RepoRec;
     const issue = target._issue as IssueRec;
