@@ -885,9 +885,9 @@ function handleFetchV2(repo: RepoRec, items: { kind: string; data: Buffer }[], r
     else if (a === "wait-for-done") waitForDone = true;
   }
   const parts: Buffer[] = [];
-  parts.push(pktLine("acknowledgments\n"));
   if (!done && !waitForDone) {
     // Negotiation round: acknowledge a common have or NAK, no pack yet.
+    parts.push(pktLine("acknowledgments\n"));
     const common = haves.find((h) => repo.objects.has(h));
     if (common) parts.push(pktLine("ACK " + common + "\n"));
     else if (haves.length) parts.push(pktLine("NAK\n"));
@@ -896,8 +896,9 @@ function handleFetchV2(repo: RepoRec, items: { kind: string; data: Buffer }[], r
     res.end(Buffer.concat(parts));
     return;
   }
-  parts.push(pktLine("ready\n"));
-  parts.push(PKT_DELIM);
+  // With "done" the negotiation is over: git's state machine now expects
+  // only the optional shallow-info / wanted-refs sections and then the
+  // packfile section — an acknowledgments section here is a protocol error.
   const { pack, shallow } = fetchPack(repo, wants, depth);
   if (depth > 0) {
     parts.push(pktLine("shallow-info\n"));
@@ -959,6 +960,15 @@ function handleReceivePack(repo: RepoRec, body: Buffer, res: ServerResponse): vo
       void e;
     }
   }
+  // Did the client ask for the side-band? It travels in the capabilities
+  // after the NUL on the first command line.
+  let useSideBand = false;
+  for (const it of items) {
+    if (it.kind !== "line") continue;
+    const text = it.data.toString("utf8");
+    const nul = text.indexOf("\0");
+    if (nul >= 0 && text.slice(nul + 1).includes("side-band-64k")) useSideBand = true;
+  }
   const report: string[] = [];
   if (unpackOk) {
     for (const u of updates) {
@@ -994,11 +1004,24 @@ function handleReceivePack(repo: RepoRec, body: Buffer, res: ServerResponse): vo
   } else {
     for (const u of updates) report.push("ng " + u.ref + " unpacker error\n");
   }
+  // The report is itself a pkt-line stream ("unpack ok", one line per ref,
+  // flush). With side-band-64k that stream is carried inside channel-1
+  // packets; without it, it is sent as-is.
+  const inner: Buffer[] = [];
+  inner.push(pktLine("unpack " + unpackMsg + "\n"));
+  for (const r of report) inner.push(pktLine(r));
+  inner.push(PKT_FLUSH);
+  const innerBuf = Buffer.concat(inner);
   const parts: Buffer[] = [];
-  const wrap = (line: string) => pktLine(Buffer.concat([Buffer.from([1]), Buffer.from(line, "utf8")]));
-  parts.push(wrap("unpack " + unpackMsg + "\n"));
-  for (const r of report) parts.push(wrap(r));
-  parts.push(PKT_FLUSH);
+  if (useSideBand) {
+    const CHUNK = 65500;
+    for (let i = 0; i < innerBuf.length; i += CHUNK) {
+      parts.push(pktLine(Buffer.concat([Buffer.from([1]), innerBuf.subarray(i, i + CHUNK)])));
+    }
+    parts.push(PKT_FLUSH);
+  } else {
+    parts.push(innerBuf);
+  }
   res.writeHead(200, { "content-type": "application/x-git-receive-pack-result" });
   res.end(Buffer.concat(parts));
 }
