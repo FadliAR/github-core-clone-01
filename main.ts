@@ -27,7 +27,10 @@ import { deflateSync, inflateSync } from "node:zlib";
 
 const ENV_URL: string = (process.env.MAKEFUN_ENV_URL || "").replace(/\/+$/, "");
 const SHOP_TOKEN: string = process.env.MAKEFUN_SHOP_TOKEN || "";
-const VIEWER_LOGIN = "octocat";
+// The login the suite's token names: the scenario's user. Every repository
+// created through the API belongs to this login, and the same name under
+// any other owner is a 404.
+const VIEWER_LOGIN = "adaiversen";
 const VIEWER_ID = 1;
 const ZERO_SHA = "0000000000000000000000000000000000000000";
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -205,12 +208,12 @@ function parseCommit(data: Buffer): CommitInfo {
 function formatPersonLine(line: string): { name: string; email: string; date: string } {
   // "Name <email> 1700000000 +0000"
   const m = /^(.*?) <(.*?)> (\d+) ([+-]\d{4})$/.exec(line.trim());
-  if (!m) return { name: line || "octocat", email: "", date: nowIsoNoTick() };
+  if (!m) return { name: line || VIEWER_LOGIN, email: "", date: nowIsoNoTick() };
   const secs = parseInt(m[3], 10);
   return { name: m[1], email: m[2], date: new Date(secs * 1000).toISOString() };
 }
 
-const AUTHOR_LINE = "octocat <octocat@example.com> 1767225600 +0000";
+const AUTHOR_LINE = "adaiversen <adaiversen@example.com> 1767225600 +0000";
 
 function makeCommit(
   repo: RepoRec,
@@ -1522,8 +1525,8 @@ function handleRest(ctx: Ctx): void {
     if (method === "GET") {
       return sendJson(ctx, 200, {
         ...userJson(VIEWER_LOGIN, ctx.base),
-        name: "The Octocat",
-        email: "octocat@example.com",
+        name: "Ada Iversen",
+        email: VIEWER_LOGIN + "@example.com",
         plan: { name: "pro", space: 976562499 },
         total_private_repos: 0,
         owned_private_repos: 0,
@@ -1876,8 +1879,8 @@ function handleContents(ctx: Ctx, repo: RepoRec, path: string): void {
         url: base + "/api/v3/repos/" + full + "/commits/" + commitSha,
         html_url: base + "/" + full + "/commit/" + commitSha,
         message,
-        author: { name: "octocat", email: "octocat@example.com", date: nowIsoNoTick() },
-        committer: { name: "octocat", email: "octocat@example.com", date: nowIsoNoTick() },
+        author: { name: VIEWER_LOGIN, email: VIEWER_LOGIN + "@example.com", date: nowIsoNoTick() },
+        committer: { name: VIEWER_LOGIN, email: VIEWER_LOGIN + "@example.com", date: nowIsoNoTick() },
       },
     });
   }
@@ -2818,7 +2821,7 @@ function gqlUser(login: string): GqlObj {
     databaseId: login === VIEWER_LOGIN ? VIEWER_ID : 2,
     login,
     name: login === VIEWER_LOGIN ? "The Octocat" : login,
-    email: login === VIEWER_LOGIN ? "octocat@example.com" : "",
+    email: login === VIEWER_LOGIN ? VIEWER_LOGIN + "@example.com" : "",
     url: "/users/" + login,
     avatarUrl: "/avatars/" + login,
     isViewer: login === VIEWER_LOGIN,
@@ -3054,7 +3057,7 @@ function gqlArgs(field: GqlField, vars: Record<string, unknown>): Record<string,
 function gqlCommit(repo: RepoRec, sha: string): GqlObj {
   const obj = getObject(repo, sha);
   const info = obj && obj.type === "commit" ? parseCommit(obj.data) : null;
-  const author = info ? formatPersonLine(info.authorLine) : { name: "octocat", email: "", date: nowIsoNoTick() };
+  const author = info ? formatPersonLine(info.authorLine) : { name: VIEWER_LOGIN, email: "", date: nowIsoNoTick() };
   return {
     __typename: "Commit",
     _repo: repo,
@@ -4249,7 +4252,7 @@ async function registerAndWait(port: number): Promise<void> {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ port }),
       });
-      if (r.ok || r.status === 409) break;
+          if (r.ok || r.status === 409) break;
     } catch {
       // env may still be starting; retry
     }
