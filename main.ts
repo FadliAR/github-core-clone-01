@@ -1153,11 +1153,10 @@ function repoJson(repo: RepoRec, base: string): Record<string, unknown> {
 }
 
 function labelJson(repo: RepoRec, label: LabelRec, base: string): Record<string, unknown> {
-  void repo;
   return {
     id: label.id,
     node_id: Buffer.from("07:Label" + label.id, "utf8").toString("base64"),
-    url: base + "/api/v3/repos/x/y/labels/" + encodeURIComponent(label.name),
+    url: base + "/api/v3/repos/" + repo.owner + "/" + repo.name + "/labels/" + encodeURIComponent(label.name),
     name: label.name,
     color: label.color,
     default: label.isDefault,
